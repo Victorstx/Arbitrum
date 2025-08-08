@@ -1,5 +1,18 @@
 ;; Arbitrum - Decentralized Legal Agreement Platform
-;; A smart contract for managing legal agreements with dispute resolution
+;; A smart contract for managing legal agreements with dispute resolution and multi-asset support
+
+;; Define the SIP-10 trait for token transfers
+(define-trait sip-010-trait
+  (
+    (transfer (uint principal principal (optional (buff 34))) (response bool uint))
+    (get-name () (response (string-ascii 32) uint))
+    (get-symbol () (response (string-ascii 32) uint))
+    (get-decimals () (response uint uint))
+    (get-balance (principal) (response uint uint))
+    (get-total-supply () (response uint uint))
+    (get-token-uri () (response (optional (string-utf8 256)) uint))
+  )
+)
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -13,6 +26,13 @@
 (define-constant ERR-INVALID-INPUT (err u107))
 (define-constant ERR-INVALID-PRINCIPAL (err u108))
 (define-constant ERR-INVALID-HASH (err u109))
+(define-constant ERR-UNSUPPORTED-ASSET (err u110))
+(define-constant ERR-TRANSFER-FAILED (err u111))
+(define-constant ERR-ASSET-MISMATCH (err u112))
+
+;; Asset Types
+(define-constant ASSET-STX u0)
+(define-constant ASSET-SIP10 u1)
 
 ;; Data Variables
 (define-data-var next-agreement-id uint u1)
@@ -25,6 +45,14 @@
 (define-constant STATUS-DISPUTED u3)
 (define-constant STATUS-RESOLVED u4)
 
+;; Asset info structure for SIP-10 tokens
+(define-map supported-assets
+  principal
+  {
+    name: (string-ascii 32),
+    enabled: bool
+  })
+
 ;; Maps
 (define-map agreements
   uint
@@ -34,6 +62,8 @@
     title: (string-ascii 100),
     ipfs-hash: (string-ascii 64),
     stake-amount: uint,
+    asset-type: uint,
+    asset-contract: (optional principal),
     status: uint,
     created-at: uint,
     signatures: uint,
@@ -77,6 +107,14 @@
 (define-read-only (get-platform-fee)
   (var-get platform-fee))
 
+(define-read-only (is-supported-asset (asset-contract principal))
+  ;; Currently only STX is natively supported
+  false)
+
+(define-read-only (get-supported-asset (asset-contract principal))
+  ;; Returns none as SIP-10 support is not yet implemented
+  none)
+
 ;; Private functions
 (define-private (is-party (agreement-id uint) (user principal))
   (match (map-get? agreements agreement-id)
@@ -85,7 +123,9 @@
     false))
 
 (define-private (both-parties-signed (agreement-id uint))
-  (is-eq (get signatures (unwrap-panic (map-get? agreements agreement-id))) u2))
+  (match (map-get? agreements agreement-id)
+    agreement (is-eq (get signatures agreement) u2)
+    false))
 
 (define-private (is-valid-principal (address principal))
   (not (is-eq address tx-sender)))
@@ -99,26 +139,61 @@
 (define-private (is-valid-title (title (string-ascii 100)))
   (and (> (len title) u0) (<= (len title) u100)))
 
+(define-private (is-valid-asset-name (name (string-ascii 32)))
+  (and (> (len name) u0) (<= (len name) u32)))
+
+;; Asset transfer functions
+(define-private (transfer-stx (amount uint) (sender principal) (recipient principal))
+  (stx-transfer? amount sender recipient))
+
+;; For this implementation, we'll focus on STX transfers
+;; SIP-10 token support can be added through specific contract integrations
+(define-private (transfer-asset (asset-type uint) (asset-contract (optional principal)) (amount uint) (sender principal) (recipient principal))
+  (if (is-eq asset-type ASSET-STX)
+    (transfer-stx amount sender recipient)
+    ;; For now, only STX is supported in the core contract
+    ;; SIP-10 tokens require specific contract integration
+    ERR-UNSUPPORTED-ASSET))
+
 ;; Public functions
 
-;; Create a new legal agreement
+;; Create a new legal agreement with STX
 (define-public (create-agreement 
   (party-b principal)
   (title (string-ascii 100))
   (ipfs-hash (string-ascii 64))
   (stake-amount uint))
+  (create-agreement-with-asset party-b title ipfs-hash stake-amount ASSET-STX none))
+
+;; Create a new legal agreement with specified asset
+(define-public (create-agreement-with-asset
+  (party-b principal)
+  (title (string-ascii 100))
+  (ipfs-hash (string-ascii 64))
+  (stake-amount uint)
+  (asset-type uint)
+  (asset-contract (optional principal)))
   (let ((agreement-id (var-get next-agreement-id)))
     (asserts! (> stake-amount u0) ERR-INSUFFICIENT-STAKE)
     (asserts! (not (is-eq party-b tx-sender)) ERR-INVALID-PRINCIPAL)
     (asserts! (is-valid-title title) ERR-INVALID-INPUT)
     (asserts! (is-valid-hash ipfs-hash) ERR-INVALID-HASH)
-    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    ;; For initial implementation, only STX is supported
+    (asserts! (is-eq asset-type ASSET-STX) ERR-UNSUPPORTED-ASSET)
+    (asserts! (is-none asset-contract) ERR-INVALID-INPUT)
+    
+    ;; Transfer stake to contract
+    (try! (transfer-asset asset-type asset-contract stake-amount tx-sender (as-contract tx-sender)))
+    
     (map-set agreements agreement-id {
       party-a: tx-sender,
       party-b: party-b,
       title: title,
       ipfs-hash: ipfs-hash,
       stake-amount: stake-amount,
+      asset-type: asset-type,
+      asset-contract: asset-contract,
       status: STATUS-PENDING,
       created-at: stacks-block-height,
       signatures: u0,
@@ -134,9 +209,21 @@
     (asserts! (is-valid-hash signature-hash) ERR-INVALID-HASH)
     (asserts! (is-none (map-get? signatures {agreement-id: agreement-id, signer: tx-sender})) 
               ERR-ALREADY-SIGNED)
+    
+    ;; If party-b is signing, they need to match the stake
+    (if (is-eq tx-sender (get party-b agreement))
+      (try! (transfer-asset 
+        (get asset-type agreement) 
+        (get asset-contract agreement) 
+        (get stake-amount agreement) 
+        tx-sender 
+        (as-contract tx-sender)))
+      true)
+    
     (map-set signatures 
       {agreement-id: agreement-id, signer: tx-sender}
       {signed-at: stacks-block-height, signature-hash: signature-hash})
+    
     (let ((new-signature-count (+ (get signatures agreement) u1)))
       (map-set agreements agreement-id 
         (merge agreement {
@@ -151,10 +238,23 @@
     (asserts! (is-party agreement-id tx-sender) ERR-NOT-PARTY)
     (asserts! (is-eq (get status agreement) STATUS-ACTIVE) ERR-INVALID-STATUS)
     (asserts! (both-parties-signed agreement-id) ERR-INVALID-STATUS)
+    
     (map-set agreements agreement-id 
       (merge agreement {status: STATUS-COMPLETED}))
-    (try! (as-contract (stx-transfer? (get stake-amount agreement) tx-sender (get party-a agreement))))
-    (try! (as-contract (stx-transfer? (get stake-amount agreement) tx-sender (get party-b agreement))))
+    
+    ;; Return stakes to both parties
+    (try! (as-contract (transfer-asset 
+      (get asset-type agreement) 
+      (get asset-contract agreement)
+      (get stake-amount agreement) 
+      tx-sender 
+      (get party-a agreement))))
+    (try! (as-contract (transfer-asset 
+      (get asset-type agreement) 
+      (get asset-contract agreement)
+      (get stake-amount agreement) 
+      tx-sender 
+      (get party-b agreement))))
     (ok true)))
 
 ;; Initiate a dispute
@@ -164,6 +264,7 @@
     (asserts! (is-eq (get status agreement) STATUS-ACTIVE) ERR-INVALID-STATUS)
     (asserts! (is-valid-string reason) ERR-INVALID-INPUT)
     (asserts! (is-none (map-get? disputes agreement-id)) ERR-ALREADY-DISPUTED)
+    
     (map-set disputes agreement-id {
       initiator: tx-sender,
       reason: reason,
@@ -187,6 +288,7 @@
     (agreement (unwrap! (map-get? agreements agreement-id) ERR-AGREEMENT-NOT-FOUND)))
     (asserts! (is-arbitrator tx-sender) ERR-UNAUTHORIZED)
     (asserts! (not (get resolved dispute)) ERR-INVALID-STATUS)
+    
     (let ((new-votes-a (if vote-for-party-a (+ (get votes-for-a dispute) u1) (get votes-for-a dispute)))
           (new-votes-b (if vote-for-party-a (get votes-for-b dispute) (+ (get votes-for-b dispute) u1))))
       (map-set disputes agreement-id 
@@ -194,6 +296,7 @@
           votes-for-a: new-votes-a,
           votes-for-b: new-votes-b
         }))
+      
       ;; Check if dispute is resolved (need at least 3 votes and clear majority)
       (if (and (>= (+ new-votes-a new-votes-b) u3)
                (or (> new-votes-a (* new-votes-b u2))
@@ -208,10 +311,37 @@
             }))
           (map-set agreements agreement-id 
             (merge agreement {status: STATUS-RESOLVED}))
-          ;; Transfer stake to winner
-          (try! (as-contract (stx-transfer? (* (get stake-amount agreement) u2) tx-sender winner)))
+          
+          ;; Transfer both stakes to winner
+          (try! (as-contract (transfer-asset 
+            (get asset-type agreement) 
+            (get asset-contract agreement)
+            (* (get stake-amount agreement) u2) 
+            tx-sender 
+            winner)))
           (ok true))
         (ok true)))))
+
+;; Asset management functions (placeholder for future SIP-10 support)
+(define-public (add-supported-asset (asset-contract principal) (name (string-ascii 32)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (not (is-eq asset-contract tx-sender)) ERR-INVALID-PRINCIPAL)
+    (asserts! (is-valid-asset-name name) ERR-INVALID-INPUT)
+    ;; Currently only STX is supported, SIP-10 support coming in future updates
+    ERR-UNSUPPORTED-ASSET))
+
+(define-public (disable-asset (asset-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    ;; SIP-10 asset management will be implemented in future versions
+    ERR-UNSUPPORTED-ASSET))
+
+(define-public (enable-asset (asset-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    ;; SIP-10 asset management will be implemented in future versions
+    ERR-UNSUPPORTED-ASSET))
 
 ;; Admin functions
 (define-public (add-arbitrator (address principal))
