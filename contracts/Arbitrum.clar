@@ -1,5 +1,5 @@
 ;; Arbitrum - Decentralized Legal Agreement Platform
-;; A smart contract for managing legal agreements with dispute resolution and multi-asset support
+;; A smart contract for managing legal agreements with dispute resolution, multi-asset support, and template library
 
 ;; Define the SIP-10 trait for token transfers
 (define-trait sip-010-trait
@@ -29,6 +29,10 @@
 (define-constant ERR-UNSUPPORTED-ASSET (err u110))
 (define-constant ERR-TRANSFER-FAILED (err u111))
 (define-constant ERR-ASSET-MISMATCH (err u112))
+(define-constant ERR-TEMPLATE-NOT-FOUND (err u113))
+(define-constant ERR-TEMPLATE-EXISTS (err u114))
+(define-constant ERR-INVALID-TEMPLATE-PARAM (err u115))
+(define-constant ERR-REQUIRED-PARAM-MISSING (err u116))
 
 ;; Asset Types
 (define-constant ASSET-STX u0)
@@ -37,6 +41,7 @@
 ;; Data Variables
 (define-data-var next-agreement-id uint u1)
 (define-data-var platform-fee uint u100) ;; 1% fee in basis points
+(define-data-var next-template-id uint u1)
 
 ;; Agreement Status
 (define-constant STATUS-PENDING u0)
@@ -44,6 +49,27 @@
 (define-constant STATUS-COMPLETED u2)
 (define-constant STATUS-DISPUTED u3)
 (define-constant STATUS-RESOLVED u4)
+
+;; Template parameter structure
+(define-map template-parameters
+  {template-id: (string-ascii 32), param-key: (string-ascii 32)}
+  {
+    param-value: (string-ascii 100),
+    required: bool
+  })
+
+;; Templates structure
+(define-map templates
+  (string-ascii 32)
+  {
+    name: (string-ascii 100),
+    category: (string-ascii 32),
+    ipfs-hash: (string-ascii 64),
+    creator: principal,
+    enabled: bool,
+    created-at: uint,
+    usage-count: uint
+  })
 
 ;; Asset info structure for SIP-10 tokens
 (define-map supported-assets
@@ -61,6 +87,7 @@
     party-b: principal,
     title: (string-ascii 100),
     ipfs-hash: (string-ascii 64),
+    template-id: (optional (string-ascii 32)),
     stake-amount: uint,
     asset-type: uint,
     asset-contract: (optional principal),
@@ -87,6 +114,11 @@
   })
 
 (define-map arbitrators principal bool)
+
+;; Agreement custom parameters for template-based agreements
+(define-map agreement-parameters
+  {agreement-id: uint, param-key: (string-ascii 32)}
+  (string-ascii 100))
 
 ;; Read-only functions
 (define-read-only (get-agreement (agreement-id uint))
@@ -115,6 +147,18 @@
   ;; Returns none as SIP-10 support is not yet implemented
   none)
 
+(define-read-only (get-template (template-id (string-ascii 32)))
+  (map-get? templates template-id))
+
+(define-read-only (get-template-parameter (template-id (string-ascii 32)) (param-key (string-ascii 32)))
+  (map-get? template-parameters {template-id: template-id, param-key: param-key}))
+
+(define-read-only (get-agreement-parameter (agreement-id uint) (param-key (string-ascii 32)))
+  (map-get? agreement-parameters {agreement-id: agreement-id, param-key: param-key}))
+
+(define-read-only (get-next-template-id)
+  (var-get next-template-id))
+
 ;; Private functions
 (define-private (is-party (agreement-id uint) (user principal))
   (match (map-get? agreements agreement-id)
@@ -142,6 +186,18 @@
 (define-private (is-valid-asset-name (name (string-ascii 32)))
   (and (> (len name) u0) (<= (len name) u32)))
 
+(define-private (is-valid-template-id (template-id (string-ascii 32)))
+  (and (> (len template-id) u0) (<= (len template-id) u32)))
+
+(define-private (is-valid-param-key (param-key (string-ascii 32)))
+  (and (> (len param-key) u0) (<= (len param-key) u32)))
+
+(define-private (is-valid-param-value (param-value (string-ascii 100)))
+  (and (> (len param-value) u0) (<= (len param-value) u100)))
+
+(define-private (is-valid-category (category (string-ascii 32)))
+  (and (> (len category) u0) (<= (len category) u32)))
+
 ;; Asset transfer functions
 (define-private (transfer-stx (amount uint) (sender principal) (recipient principal))
   (stx-transfer? amount sender recipient))
@@ -154,6 +210,95 @@
     ;; For now, only STX is supported in the core contract
     ;; SIP-10 tokens require specific contract integration
     ERR-UNSUPPORTED-ASSET))
+
+;; Template management functions
+
+;; Add a new template (admin only)
+(define-public (add-template 
+  (template-id (string-ascii 32))
+  (name (string-ascii 100))
+  (category (string-ascii 32))
+  (ipfs-hash (string-ascii 64)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-template-id template-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-title name) ERR-INVALID-INPUT)
+    (asserts! (is-valid-category category) ERR-INVALID-INPUT)
+    (asserts! (is-valid-hash ipfs-hash) ERR-INVALID-HASH)
+    (asserts! (is-none (map-get? templates template-id)) ERR-TEMPLATE-EXISTS)
+    
+    (map-set templates template-id {
+      name: name,
+      category: category,
+      ipfs-hash: ipfs-hash,
+      creator: tx-sender,
+      enabled: true,
+      created-at: stacks-block-height,
+      usage-count: u0
+    })
+    (ok true)))
+
+;; Update existing template (admin only)
+(define-public (update-template
+  (template-id (string-ascii 32))
+  (name (string-ascii 100))
+  (ipfs-hash (string-ascii 64)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-template-id template-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-title name) ERR-INVALID-INPUT)
+    (asserts! (is-valid-hash ipfs-hash) ERR-INVALID-HASH)
+    
+    (match (map-get? templates template-id)
+      template (let ((validated-id template-id))
+        (map-set templates validated-id {
+          name: name,
+          category: (get category template),
+          ipfs-hash: ipfs-hash,
+          creator: (get creator template),
+          enabled: (get enabled template),
+          created-at: (get created-at template),
+          usage-count: (get usage-count template)
+        })
+        (ok true))
+      ERR-TEMPLATE-NOT-FOUND)))
+
+;; Add template parameter definition (admin only)
+(define-public (add-template-parameter
+  (template-id (string-ascii 32))
+  (param-key (string-ascii 32))
+  (default-value (string-ascii 100))
+  (required bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-some (map-get? templates template-id)) ERR-TEMPLATE-NOT-FOUND)
+    (asserts! (is-valid-param-key param-key) ERR-INVALID-INPUT)
+    (asserts! (is-valid-param-value default-value) ERR-INVALID-INPUT)
+    
+    (map-set template-parameters 
+      {template-id: template-id, param-key: param-key}
+      {param-value: default-value, required: required})
+    (ok true)))
+
+;; Enable/disable template (admin only)
+(define-public (toggle-template (template-id (string-ascii 32)) (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-template-id template-id) ERR-INVALID-INPUT)
+    
+    (match (map-get? templates template-id)
+      template (let ((validated-id template-id))
+        (map-set templates validated-id {
+          name: (get name template),
+          category: (get category template),
+          ipfs-hash: (get ipfs-hash template),
+          creator: (get creator template),
+          enabled: enabled,
+          created-at: (get created-at template),
+          usage-count: (get usage-count template)
+        })
+        (ok true))
+      ERR-TEMPLATE-NOT-FOUND)))
 
 ;; Public functions
 
@@ -191,6 +336,7 @@
       party-b: party-b,
       title: title,
       ipfs-hash: ipfs-hash,
+      template-id: none,
       stake-amount: stake-amount,
       asset-type: asset-type,
       asset-contract: asset-contract,
@@ -201,6 +347,66 @@
     })
     (var-set next-agreement-id (+ agreement-id u1))
     (ok agreement-id)))
+
+;; Create agreement from template
+(define-public (create-agreement-from-template
+  (party-b principal)
+  (template-id (string-ascii 32))
+  (stake-amount uint)
+  (custom-params (list 20 {key: (string-ascii 32), value: (string-ascii 100)})))
+  (let (
+    (template (unwrap! (map-get? templates template-id) ERR-TEMPLATE-NOT-FOUND))
+    (agreement-id (var-get next-agreement-id)))
+    
+    (asserts! (> stake-amount u0) ERR-INSUFFICIENT-STAKE)
+    (asserts! (not (is-eq party-b tx-sender)) ERR-INVALID-PRINCIPAL)
+    (asserts! (get enabled template) ERR-INVALID-STATUS)
+    
+    ;; Transfer stake to contract
+    (try! (transfer-asset ASSET-STX none stake-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Store custom parameters
+    (fold store-single-parameter custom-params agreement-id)
+    
+    ;; Update template usage count
+    (match (map-get? templates template-id)
+      existing-template (map-set templates template-id {
+        name: (get name existing-template),
+        category: (get category existing-template),
+        ipfs-hash: (get ipfs-hash existing-template),
+        creator: (get creator existing-template),
+        enabled: (get enabled existing-template),
+        created-at: (get created-at existing-template),
+        usage-count: (+ (get usage-count existing-template) u1)
+      })
+      false)
+    
+    (map-set agreements agreement-id {
+      party-a: tx-sender,
+      party-b: party-b,
+      title: (get name template),
+      ipfs-hash: (get ipfs-hash template),
+      template-id: (some template-id),
+      stake-amount: stake-amount,
+      asset-type: ASSET-STX,
+      asset-contract: none,
+      status: STATUS-PENDING,
+      created-at: stacks-block-height,
+      signatures: u0,
+      dispute-reason: none
+    })
+    (var-set next-agreement-id (+ agreement-id u1))
+    (ok agreement-id)))
+
+;; Helper function to store agreement parameters
+(define-private (store-single-parameter 
+  (param {key: (string-ascii 32), value: (string-ascii 100)})
+  (agreement-id uint))
+  (begin
+    (map-set agreement-parameters 
+      {agreement-id: agreement-id, param-key: (get key param)}
+      (get value param))
+    agreement-id))
 
 ;; Sign an agreement
 (define-public (sign-agreement (agreement-id uint) (signature-hash (string-ascii 64)))
@@ -365,5 +571,109 @@
     (var-set platform-fee new-fee)
     (ok true)))
 
-;; Initialize contract with owner as first arbitrator
+;; Initialize default templates
+(define-private (init-default-templates)
+  (begin
+    ;; Initialize NDA template
+    (map-set templates "TEMPLATE-NDA" {
+      name: "Non-Disclosure Agreement",
+      category: "confidentiality",
+      ipfs-hash: "QmNDATemplateHash123456789012345678901234567890123456789012",
+      creator: CONTRACT-OWNER,
+      enabled: true,
+      created-at: stacks-block-height,
+      usage-count: u0
+    })
+    
+    ;; Initialize Employment template  
+    (map-set templates "TEMPLATE-EMPLOYMENT" {
+      name: "Employment Contract",
+      category: "employment",
+      ipfs-hash: "QmEMPTemplateHash123456789012345678901234567890123456789012",
+      creator: CONTRACT-OWNER,
+      enabled: true,
+      created-at: stacks-block-height,
+      usage-count: u0
+    })
+    
+    ;; Initialize Partnership template
+    (map-set templates "TEMPLATE-PARTNERSHIP" {
+      name: "Partnership Agreement", 
+      category: "business",
+      ipfs-hash: "QmPARTemplateHash123456789012345678901234567890123456789012",
+      creator: CONTRACT-OWNER,
+      enabled: true,
+      created-at: stacks-block-height,
+      usage-count: u0
+    })
+    
+    ;; Initialize Service template
+    (map-set templates "TEMPLATE-SERVICE" {
+      name: "Service Agreement",
+      category: "service",
+      ipfs-hash: "QmSRVTemplateHash123456789012345678901234567890123456789012",
+      creator: CONTRACT-OWNER,
+      enabled: true,
+      created-at: stacks-block-height,
+      usage-count: u0
+    })
+    
+    ;; Initialize Vendor template
+    (map-set templates "TEMPLATE-VENDOR" {
+      name: "Vendor Contract",
+      category: "vendor",
+      ipfs-hash: "QmVNDTemplateHash123456789012345678901234567890123456789012",
+      creator: CONTRACT-OWNER,
+      enabled: true,
+      created-at: stacks-block-height,
+      usage-count: u0
+    })
+    
+    ;; Add default parameters for NDA template
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-NDA", param-key: "confidentiality-period"}
+      {param-value: "24", required: true})
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-NDA", param-key: "mutual-disclosure"}
+      {param-value: "true", required: false})
+    
+    ;; Add default parameters for Employment template
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-EMPLOYMENT", param-key: "job-title"}
+      {param-value: "Employee", required: true})
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-EMPLOYMENT", param-key: "salary-amount"}
+      {param-value: "50000", required: true})
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-EMPLOYMENT", param-key: "start-date"}
+      {param-value: "2025-01-01", required: true})
+    
+    ;; Add default parameters for Partnership template
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-PARTNERSHIP", param-key: "partnership-percentage"}
+      {param-value: "50", required: true})
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-PARTNERSHIP", param-key: "capital-contribution"}
+      {param-value: "10000", required: false})
+    
+    ;; Add default parameters for Service template
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-SERVICE", param-key: "service-scope"}
+      {param-value: "Consulting Services", required: true})
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-SERVICE", param-key: "project-timeline"}
+      {param-value: "30", required: true})
+    
+    ;; Add default parameters for Vendor template
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-VENDOR", param-key: "product-description"}
+      {param-value: "Goods and Services", required: true})
+    (map-set template-parameters 
+      {template-id: "TEMPLATE-VENDOR", param-key: "delivery-timeline"}
+      {param-value: "14", required: true})
+    
+    true))
+
+;; Initialize contract with owner as first arbitrator and default templates
 (map-set arbitrators CONTRACT-OWNER true)
+(init-default-templates)
