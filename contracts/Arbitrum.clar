@@ -1,5 +1,5 @@
 ;; Arbitrum - Decentralized Legal Agreement Platform
-;; A smart contract for managing legal agreements with dispute resolution, multi-asset support, and template library
+;; A smart contract for managing legal agreements with dispute resolution, multi-asset support, template library, and AI-powered contract analysis
 
 ;; Define the SIP-10 trait for token transfers
 (define-trait sip-010-trait
@@ -33,15 +33,27 @@
 (define-constant ERR-TEMPLATE-EXISTS (err u114))
 (define-constant ERR-INVALID-TEMPLATE-PARAM (err u115))
 (define-constant ERR-REQUIRED-PARAM-MISSING (err u116))
+(define-constant ERR-ANALYSIS-NOT-FOUND (err u117))
+(define-constant ERR-INVALID-SCORE (err u118))
+(define-constant ERR-ANALYSIS-EXISTS (err u119))
+(define-constant ERR-INVALID-ORACLE (err u120))
 
 ;; Asset Types
 (define-constant ASSET-STX u0)
 (define-constant ASSET-SIP10 u1)
 
+;; AI Analysis Risk Levels
+(define-constant RISK-LOW u0)
+(define-constant RISK-MEDIUM u1)
+(define-constant RISK-HIGH u2)
+(define-constant RISK-CRITICAL u3)
+
 ;; Data Variables
 (define-data-var next-agreement-id uint u1)
 (define-data-var platform-fee uint u100) ;; 1% fee in basis points
 (define-data-var next-template-id uint u1)
+(define-data-var ai-analysis-enabled bool true)
+(define-data-var minimum-analysis-score uint u60) ;; Minimum score of 60/100
 
 ;; Agreement Status
 (define-constant STATUS-PENDING u0)
@@ -79,6 +91,40 @@
     enabled: bool
   })
 
+;; AI Analysis Results
+(define-map ai-analysis
+  uint
+  {
+    agreement-id: uint,
+    risk-score: uint,
+    risk-level: uint,
+    analyzed-at: uint,
+    oracle: principal,
+    issues-found: uint,
+    recommendations: (string-ascii 500),
+    compliance-score: uint,
+    clarity-score: uint
+  })
+
+;; AI Oracle Registry
+(define-map ai-oracles
+  principal
+  {
+    name: (string-ascii 50),
+    enabled: bool,
+    analyses-count: uint,
+    registered-at: uint
+  })
+
+;; Analysis Issues
+(define-map analysis-issues
+  {agreement-id: uint, issue-index: uint}
+  {
+    severity: uint,
+    category: (string-ascii 50),
+    description: (string-ascii 200)
+  })
+
 ;; Maps
 (define-map agreements
   uint
@@ -94,7 +140,9 @@
     status: uint,
     created-at: uint,
     signatures: uint,
-    dispute-reason: (optional (string-ascii 200))
+    dispute-reason: (optional (string-ascii 200)),
+    ai-analyzed: bool,
+    analysis-passed: bool
   })
 
 (define-map signatures
@@ -140,11 +188,9 @@
   (var-get platform-fee))
 
 (define-read-only (is-supported-asset (asset-contract principal))
-  ;; Currently only STX is natively supported
   false)
 
 (define-read-only (get-supported-asset (asset-contract principal))
-  ;; Returns none as SIP-10 support is not yet implemented
   none)
 
 (define-read-only (get-template (template-id (string-ascii 32)))
@@ -158,6 +204,26 @@
 
 (define-read-only (get-next-template-id)
   (var-get next-template-id))
+
+(define-read-only (get-ai-analysis (agreement-id uint))
+  (map-get? ai-analysis agreement-id))
+
+(define-read-only (get-analysis-issue (agreement-id uint) (issue-index uint))
+  (map-get? analysis-issues {agreement-id: agreement-id, issue-index: issue-index}))
+
+(define-read-only (is-ai-oracle (oracle principal))
+  (match (map-get? ai-oracles oracle)
+    oracle-data (get enabled oracle-data)
+    false))
+
+(define-read-only (get-ai-oracle (oracle principal))
+  (map-get? ai-oracles oracle))
+
+(define-read-only (is-ai-analysis-enabled)
+  (var-get ai-analysis-enabled))
+
+(define-read-only (get-minimum-analysis-score)
+  (var-get minimum-analysis-score))
 
 ;; Private functions
 (define-private (is-party (agreement-id uint) (user principal))
@@ -198,22 +264,156 @@
 (define-private (is-valid-category (category (string-ascii 32)))
   (and (> (len category) u0) (<= (len category) u32)))
 
+(define-private (is-valid-score (score uint))
+  (and (>= score u0) (<= score u100)))
+
+(define-private (is-valid-risk-level (risk-level uint))
+  (and (>= risk-level u0) (<= risk-level u3)))
+
+(define-private (is-valid-oracle-name (name (string-ascii 50)))
+  (and (> (len name) u0) (<= (len name) u50)))
+
+(define-private (is-valid-recommendations (recommendations (string-ascii 500)))
+  (and (>= (len recommendations) u0) (<= (len recommendations) u500)))
+
+(define-private (is-valid-issue-category (category (string-ascii 50)))
+  (and (> (len category) u0) (<= (len category) u50)))
+
+(define-private (is-valid-issue-description (description (string-ascii 200)))
+  (and (> (len description) u0) (<= (len description) u200)))
+
 ;; Asset transfer functions
 (define-private (transfer-stx (amount uint) (sender principal) (recipient principal))
   (stx-transfer? amount sender recipient))
 
-;; For this implementation, we'll focus on STX transfers
-;; SIP-10 token support can be added through specific contract integrations
 (define-private (transfer-asset (asset-type uint) (asset-contract (optional principal)) (amount uint) (sender principal) (recipient principal))
   (if (is-eq asset-type ASSET-STX)
     (transfer-stx amount sender recipient)
-    ;; For now, only STX is supported in the core contract
-    ;; SIP-10 tokens require specific contract integration
     ERR-UNSUPPORTED-ASSET))
+
+;; AI Analysis Functions
+
+;; Register AI Oracle
+(define-public (register-ai-oracle (oracle principal) (name (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (not (is-eq oracle CONTRACT-OWNER)) ERR-INVALID-PRINCIPAL)
+    (asserts! (is-valid-oracle-name name) ERR-INVALID-INPUT)
+    (asserts! (is-none (map-get? ai-oracles oracle)) ERR-INVALID-ORACLE)
+    
+    (map-set ai-oracles oracle {
+      name: name,
+      enabled: true,
+      analyses-count: u0,
+      registered-at: stacks-block-height
+    })
+    (ok true)))
+
+;; Enable/Disable AI Oracle
+(define-public (toggle-ai-oracle (oracle principal) (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    
+    (match (map-get? ai-oracles oracle)
+      oracle-data 
+        (begin
+          (map-set ai-oracles oracle 
+            (merge oracle-data {enabled: enabled}))
+          (ok true))
+      ERR-INVALID-ORACLE)))
+
+;; Submit AI Analysis
+(define-public (submit-ai-analysis
+  (agreement-id uint)
+  (risk-score uint)
+  (risk-level uint)
+  (issues-found uint)
+  (recommendations (string-ascii 500))
+  (compliance-score uint)
+  (clarity-score uint))
+  (let (
+    (agreement (unwrap! (map-get? agreements agreement-id) ERR-AGREEMENT-NOT-FOUND))
+    (oracle-data (unwrap! (map-get? ai-oracles tx-sender) ERR-UNAUTHORIZED)))
+    
+    (asserts! (get enabled oracle-data) ERR-UNAUTHORIZED)
+    (asserts! (not (get ai-analyzed agreement)) ERR-ANALYSIS-EXISTS)
+    (asserts! (is-valid-score risk-score) ERR-INVALID-SCORE)
+    (asserts! (is-valid-score compliance-score) ERR-INVALID-SCORE)
+    (asserts! (is-valid-score clarity-score) ERR-INVALID-SCORE)
+    (asserts! (is-valid-risk-level risk-level) ERR-INVALID-INPUT)
+    (asserts! (is-valid-recommendations recommendations) ERR-INVALID-INPUT)
+    
+    ;; Store analysis result
+    (map-set ai-analysis agreement-id {
+      agreement-id: agreement-id,
+      risk-score: risk-score,
+      risk-level: risk-level,
+      analyzed-at: stacks-block-height,
+      oracle: tx-sender,
+      issues-found: issues-found,
+      recommendations: recommendations,
+      compliance-score: compliance-score,
+      clarity-score: clarity-score
+    })
+    
+    ;; Update agreement with analysis status
+    (map-set agreements agreement-id
+      (merge agreement {
+        ai-analyzed: true,
+        analysis-passed: (>= risk-score (var-get minimum-analysis-score))
+      }))
+    
+    ;; Increment oracle analysis count
+    (map-set ai-oracles tx-sender
+      (merge oracle-data {
+        analyses-count: (+ (get analyses-count oracle-data) u1)
+      }))
+    
+    (ok true)))
+
+;; Add analysis issue
+(define-public (add-analysis-issue
+  (agreement-id uint)
+  (issue-index uint)
+  (severity uint)
+  (category (string-ascii 50))
+  (description (string-ascii 200)))
+  (let (
+    (analysis (unwrap! (map-get? ai-analysis agreement-id) ERR-ANALYSIS-NOT-FOUND)))
+    
+    (asserts! (is-ai-oracle tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get oracle analysis) tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-risk-level severity) ERR-INVALID-INPUT)
+    (asserts! (is-valid-issue-category category) ERR-INVALID-INPUT)
+    (asserts! (is-valid-issue-description description) ERR-INVALID-INPUT)
+    (asserts! (< issue-index (get issues-found analysis)) ERR-INVALID-INPUT)
+    
+    (map-set analysis-issues 
+      {agreement-id: agreement-id, issue-index: issue-index}
+      {
+        severity: severity,
+        category: category,
+        description: description
+      })
+    (ok true)))
+
+;; Toggle AI Analysis Feature
+(define-public (toggle-ai-analysis (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set ai-analysis-enabled enabled)
+    (ok true)))
+
+;; Update Minimum Analysis Score
+(define-public (update-minimum-analysis-score (new-score uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-valid-score new-score) ERR-INVALID-SCORE)
+    (var-set minimum-analysis-score new-score)
+    (ok true)))
 
 ;; Template management functions
 
-;; Add a new template (admin only)
 (define-public (add-template 
   (template-id (string-ascii 32))
   (name (string-ascii 100))
@@ -238,7 +438,6 @@
     })
     (ok true)))
 
-;; Update existing template (admin only)
 (define-public (update-template
   (template-id (string-ascii 32))
   (name (string-ascii 100))
@@ -250,20 +449,20 @@
     (asserts! (is-valid-hash ipfs-hash) ERR-INVALID-HASH)
     
     (match (map-get? templates template-id)
-      template (let ((validated-id template-id))
-        (map-set templates validated-id {
-          name: name,
-          category: (get category template),
-          ipfs-hash: ipfs-hash,
-          creator: (get creator template),
-          enabled: (get enabled template),
-          created-at: (get created-at template),
-          usage-count: (get usage-count template)
-        })
-        (ok true))
+      template 
+        (begin
+          (map-set templates template-id {
+            name: name,
+            category: (get category template),
+            ipfs-hash: ipfs-hash,
+            creator: (get creator template),
+            enabled: (get enabled template),
+            created-at: (get created-at template),
+            usage-count: (get usage-count template)
+          })
+          (ok true))
       ERR-TEMPLATE-NOT-FOUND)))
 
-;; Add template parameter definition (admin only)
 (define-public (add-template-parameter
   (template-id (string-ascii 32))
   (param-key (string-ascii 32))
@@ -280,29 +479,28 @@
       {param-value: default-value, required: required})
     (ok true)))
 
-;; Enable/disable template (admin only)
 (define-public (toggle-template (template-id (string-ascii 32)) (enabled bool))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (is-valid-template-id template-id) ERR-INVALID-INPUT)
     
     (match (map-get? templates template-id)
-      template (let ((validated-id template-id))
-        (map-set templates validated-id {
-          name: (get name template),
-          category: (get category template),
-          ipfs-hash: (get ipfs-hash template),
-          creator: (get creator template),
-          enabled: enabled,
-          created-at: (get created-at template),
-          usage-count: (get usage-count template)
-        })
-        (ok true))
+      template 
+        (begin
+          (map-set templates template-id {
+            name: (get name template),
+            category: (get category template),
+            ipfs-hash: (get ipfs-hash template),
+            creator: (get creator template),
+            enabled: enabled,
+            created-at: (get created-at template),
+            usage-count: (get usage-count template)
+          })
+          (ok true))
       ERR-TEMPLATE-NOT-FOUND)))
 
 ;; Public functions
 
-;; Create a new legal agreement with STX
 (define-public (create-agreement 
   (party-b principal)
   (title (string-ascii 100))
@@ -310,7 +508,6 @@
   (stake-amount uint))
   (create-agreement-with-asset party-b title ipfs-hash stake-amount ASSET-STX none))
 
-;; Create a new legal agreement with specified asset
 (define-public (create-agreement-with-asset
   (party-b principal)
   (title (string-ascii 100))
@@ -323,12 +520,9 @@
     (asserts! (not (is-eq party-b tx-sender)) ERR-INVALID-PRINCIPAL)
     (asserts! (is-valid-title title) ERR-INVALID-INPUT)
     (asserts! (is-valid-hash ipfs-hash) ERR-INVALID-HASH)
-    
-    ;; For initial implementation, only STX is supported
     (asserts! (is-eq asset-type ASSET-STX) ERR-UNSUPPORTED-ASSET)
     (asserts! (is-none asset-contract) ERR-INVALID-INPUT)
     
-    ;; Transfer stake to contract
     (try! (transfer-asset asset-type asset-contract stake-amount tx-sender (as-contract tx-sender)))
     
     (map-set agreements agreement-id {
@@ -343,12 +537,13 @@
       status: STATUS-PENDING,
       created-at: stacks-block-height,
       signatures: u0,
-      dispute-reason: none
+      dispute-reason: none,
+      ai-analyzed: false,
+      analysis-passed: false
     })
     (var-set next-agreement-id (+ agreement-id u1))
     (ok agreement-id)))
 
-;; Create agreement from template
 (define-public (create-agreement-from-template
   (party-b principal)
   (template-id (string-ascii 32))
@@ -362,23 +557,21 @@
     (asserts! (not (is-eq party-b tx-sender)) ERR-INVALID-PRINCIPAL)
     (asserts! (get enabled template) ERR-INVALID-STATUS)
     
-    ;; Transfer stake to contract
     (try! (transfer-asset ASSET-STX none stake-amount tx-sender (as-contract tx-sender)))
     
-    ;; Store custom parameters
     (fold store-single-parameter custom-params agreement-id)
     
-    ;; Update template usage count
     (match (map-get? templates template-id)
-      existing-template (map-set templates template-id {
-        name: (get name existing-template),
-        category: (get category existing-template),
-        ipfs-hash: (get ipfs-hash existing-template),
-        creator: (get creator existing-template),
-        enabled: (get enabled existing-template),
-        created-at: (get created-at existing-template),
-        usage-count: (+ (get usage-count existing-template) u1)
-      })
+      existing-template 
+        (map-set templates template-id {
+          name: (get name existing-template),
+          category: (get category existing-template),
+          ipfs-hash: (get ipfs-hash existing-template),
+          creator: (get creator existing-template),
+          enabled: (get enabled existing-template),
+          created-at: (get created-at existing-template),
+          usage-count: (+ (get usage-count existing-template) u1)
+        })
       false)
     
     (map-set agreements agreement-id {
@@ -393,12 +586,13 @@
       status: STATUS-PENDING,
       created-at: stacks-block-height,
       signatures: u0,
-      dispute-reason: none
+      dispute-reason: none,
+      ai-analyzed: false,
+      analysis-passed: false
     })
     (var-set next-agreement-id (+ agreement-id u1))
     (ok agreement-id)))
 
-;; Helper function to store agreement parameters
 (define-private (store-single-parameter 
   (param {key: (string-ascii 32), value: (string-ascii 100)})
   (agreement-id uint))
@@ -408,7 +602,6 @@
       (get value param))
     agreement-id))
 
-;; Sign an agreement
 (define-public (sign-agreement (agreement-id uint) (signature-hash (string-ascii 64)))
   (let ((agreement (unwrap! (map-get? agreements agreement-id) ERR-AGREEMENT-NOT-FOUND)))
     (asserts! (is-party agreement-id tx-sender) ERR-NOT-PARTY)
@@ -416,7 +609,6 @@
     (asserts! (is-none (map-get? signatures {agreement-id: agreement-id, signer: tx-sender})) 
               ERR-ALREADY-SIGNED)
     
-    ;; If party-b is signing, they need to match the stake
     (if (is-eq tx-sender (get party-b agreement))
       (try! (transfer-asset 
         (get asset-type agreement) 
@@ -438,7 +630,6 @@
         }))
       (ok true))))
 
-;; Complete an agreement (both parties must call this)
 (define-public (complete-agreement (agreement-id uint))
   (let ((agreement (unwrap! (map-get? agreements agreement-id) ERR-AGREEMENT-NOT-FOUND)))
     (asserts! (is-party agreement-id tx-sender) ERR-NOT-PARTY)
@@ -448,7 +639,6 @@
     (map-set agreements agreement-id 
       (merge agreement {status: STATUS-COMPLETED}))
     
-    ;; Return stakes to both parties
     (try! (as-contract (transfer-asset 
       (get asset-type agreement) 
       (get asset-contract agreement)
@@ -463,7 +653,6 @@
       (get party-b agreement))))
     (ok true)))
 
-;; Initiate a dispute
 (define-public (create-dispute (agreement-id uint) (reason (string-ascii 200)))
   (let ((agreement (unwrap! (map-get? agreements agreement-id) ERR-AGREEMENT-NOT-FOUND)))
     (asserts! (is-party agreement-id tx-sender) ERR-NOT-PARTY)
@@ -487,7 +676,6 @@
       }))
     (ok true)))
 
-;; Vote on a dispute (arbitrators only)
 (define-public (vote-on-dispute (agreement-id uint) (vote-for-party-a bool))
   (let (
     (dispute (unwrap! (map-get? disputes agreement-id) ERR-AGREEMENT-NOT-FOUND))
@@ -503,7 +691,6 @@
           votes-for-b: new-votes-b
         }))
       
-      ;; Check if dispute is resolved (need at least 3 votes and clear majority)
       (if (and (>= (+ new-votes-a new-votes-b) u3)
                (or (> new-votes-a (* new-votes-b u2))
                    (> new-votes-b (* new-votes-a u2))))
@@ -518,7 +705,6 @@
           (map-set agreements agreement-id 
             (merge agreement {status: STATUS-RESOLVED}))
           
-          ;; Transfer both stakes to winner
           (try! (as-contract (transfer-asset 
             (get asset-type agreement) 
             (get asset-contract agreement)
@@ -528,28 +714,23 @@
           (ok true))
         (ok true)))))
 
-;; Asset management functions (placeholder for future SIP-10 support)
 (define-public (add-supported-asset (asset-contract principal) (name (string-ascii 32)))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (not (is-eq asset-contract tx-sender)) ERR-INVALID-PRINCIPAL)
     (asserts! (is-valid-asset-name name) ERR-INVALID-INPUT)
-    ;; Currently only STX is supported, SIP-10 support coming in future updates
     ERR-UNSUPPORTED-ASSET))
 
 (define-public (disable-asset (asset-contract principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
-    ;; SIP-10 asset management will be implemented in future versions
     ERR-UNSUPPORTED-ASSET))
 
 (define-public (enable-asset (asset-contract principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
-    ;; SIP-10 asset management will be implemented in future versions
     ERR-UNSUPPORTED-ASSET))
 
-;; Admin functions
 (define-public (add-arbitrator (address principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
@@ -567,14 +748,12 @@
 (define-public (update-platform-fee (new-fee uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
-    (asserts! (<= new-fee u1000) ERR-INVALID-INPUT) ;; Max 10% fee
+    (asserts! (<= new-fee u1000) ERR-INVALID-INPUT)
     (var-set platform-fee new-fee)
     (ok true)))
 
-;; Initialize default templates
 (define-private (init-default-templates)
   (begin
-    ;; Initialize NDA template
     (map-set templates "TEMPLATE-NDA" {
       name: "Non-Disclosure Agreement",
       category: "confidentiality",
@@ -585,7 +764,6 @@
       usage-count: u0
     })
     
-    ;; Initialize Employment template  
     (map-set templates "TEMPLATE-EMPLOYMENT" {
       name: "Employment Contract",
       category: "employment",
@@ -596,7 +774,6 @@
       usage-count: u0
     })
     
-    ;; Initialize Partnership template
     (map-set templates "TEMPLATE-PARTNERSHIP" {
       name: "Partnership Agreement", 
       category: "business",
@@ -607,7 +784,6 @@
       usage-count: u0
     })
     
-    ;; Initialize Service template
     (map-set templates "TEMPLATE-SERVICE" {
       name: "Service Agreement",
       category: "service",
@@ -618,7 +794,6 @@
       usage-count: u0
     })
     
-    ;; Initialize Vendor template
     (map-set templates "TEMPLATE-VENDOR" {
       name: "Vendor Contract",
       category: "vendor",
@@ -629,7 +804,6 @@
       usage-count: u0
     })
     
-    ;; Add default parameters for NDA template
     (map-set template-parameters 
       {template-id: "TEMPLATE-NDA", param-key: "confidentiality-period"}
       {param-value: "24", required: true})
@@ -637,7 +811,6 @@
       {template-id: "TEMPLATE-NDA", param-key: "mutual-disclosure"}
       {param-value: "true", required: false})
     
-    ;; Add default parameters for Employment template
     (map-set template-parameters 
       {template-id: "TEMPLATE-EMPLOYMENT", param-key: "job-title"}
       {param-value: "Employee", required: true})
@@ -648,7 +821,6 @@
       {template-id: "TEMPLATE-EMPLOYMENT", param-key: "start-date"}
       {param-value: "2025-01-01", required: true})
     
-    ;; Add default parameters for Partnership template
     (map-set template-parameters 
       {template-id: "TEMPLATE-PARTNERSHIP", param-key: "partnership-percentage"}
       {param-value: "50", required: true})
@@ -656,7 +828,6 @@
       {template-id: "TEMPLATE-PARTNERSHIP", param-key: "capital-contribution"}
       {param-value: "10000", required: false})
     
-    ;; Add default parameters for Service template
     (map-set template-parameters 
       {template-id: "TEMPLATE-SERVICE", param-key: "service-scope"}
       {param-value: "Consulting Services", required: true})
@@ -664,7 +835,6 @@
       {template-id: "TEMPLATE-SERVICE", param-key: "project-timeline"}
       {param-value: "30", required: true})
     
-    ;; Add default parameters for Vendor template
     (map-set template-parameters 
       {template-id: "TEMPLATE-VENDOR", param-key: "product-description"}
       {param-value: "Goods and Services", required: true})
@@ -674,6 +844,5 @@
     
     true))
 
-;; Initialize contract with owner as first arbitrator and default templates
 (map-set arbitrators CONTRACT-OWNER true)
 (init-default-templates)
